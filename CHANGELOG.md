@@ -12,6 +12,10 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 
 ## jax 0.4.38
 
+* Breaking changes
+  * Enable `jax_threefry_partitionable` by default (see
+    [the update note](https://github.com/jax-ml/jax/discussions/18480)).
+
 * Changes:
   * `jax.tree.flatten_with_path` and `jax.tree.map_with_path` are added
     as shortcuts of the corresponding `tree_util` functions.
@@ -32,6 +36,8 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 ## jax 0.4.37 (Dec 9, 2024)
 
 This is a patch release of jax 0.4.36. Only "jax" was released at this version.
+
+## jax 0.4.37
 
 * Bug fixes
   * Fixed a bug where `jit` would error if an argument was named `f` (#25329).

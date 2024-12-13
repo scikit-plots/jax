@@ -874,7 +874,8 @@ FailureOr<xla::Array<Value>> ext_op_rule_impl(RewriteContext &ctx,
       int64_t vreg_part = *(input_vreg_idxs.end() - 2) % packing;
       *(input_vreg_idxs.end() - 2) /= packing;
       *v = builder.create<UnpackSubelementsOp>(
-          op.getLoc(), res_vreg_ty, input_vregs(input_vreg_idxs), vreg_part);
+          op.getLoc(), res_vreg_ty, input_vregs(input_vreg_idxs), vreg_part,
+          tpu::PackFormat::kCompressed);
     });
   } else {
     if (layout_in.tiling() != layout_out.tiling()) {
@@ -890,7 +891,8 @@ FailureOr<xla::Array<Value>> ext_op_rule_impl(RewriteContext &ctx,
       input_vreg_idxs.back() /= packing;
       const int64_t vreg_part = idxs.back() % packing;
       *v = builder.create<UnpackSubelementsOp>(
-          op.getLoc(), res_vreg_ty, input_vregs(input_vreg_idxs), vreg_part);
+          op.getLoc(), res_vreg_ty, input_vregs(input_vreg_idxs), vreg_part,
+          tpu::PackFormat::kCompressed);
     });
   }
   return output_vregs;
@@ -3907,6 +3909,7 @@ LogicalResult vector_multi_reduction_rule(RewriteContext &ctx, Operation &op,
   TPU_ASSERT_EQ_OP(layouts_out.size(), 1);
   TPU_ASSERT_OP(
       llvm::all_of(layouts_in, [&](const Layout &l) { return l.has_value(); }));
+  const Location loc = op.getLoc();
   const VectorLayout &src_layout = *layouts_in[0];
   const VectorLayout &acc_layout = *layouts_in[1];
   const VectorLayout &dst_layout = *layouts_out[0];
@@ -4120,16 +4123,16 @@ LogicalResult vector_multi_reduction_rule(RewriteContext &ctx, Operation &op,
               } else {
                 switch (tpu_kind) {
                   case tpu::ReductionKind::SUM:
-                    acc_vreg = builder.create<arith::AddFOp>(vreg.getLoc(),
-                                                             *acc_vreg, vreg);
+                    acc_vreg =
+                        builder.create<arith::AddFOp>(loc, *acc_vreg, vreg);
                     break;
                   case tpu::ReductionKind::MAX:
-                    acc_vreg = builder.create<arith::MaximumFOp>(
-                        vreg.getLoc(), *acc_vreg, vreg);
+                    acc_vreg =
+                        builder.create<arith::MaximumFOp>(loc, *acc_vreg, vreg);
                     break;
                   case tpu::ReductionKind::MIN:
-                    acc_vreg = builder.create<arith::MinimumFOp>(
-                        vreg.getLoc(), *acc_vreg, vreg);
+                    acc_vreg =
+                        builder.create<arith::MinimumFOp>(loc, *acc_vreg, vreg);
                     break;
                 }
               }
@@ -4144,6 +4147,48 @@ LogicalResult vector_multi_reduction_rule(RewriteContext &ctx, Operation &op,
               multi_reduction_op->getLoc(), *acc_vreg, 1, tpu_kind);
         }
         if (reduces[0]) {
+          // Packed types are compressed along rows, so we need to reduce them
+          // within each 32-bit word.
+          if (acc_layout.packing() > 1) {
+            if (acc_layout.packing() != 2) {
+              multi_reduction_op.emitOpError(
+                  "Not implemented: Only 32- and 16-bit element types "
+                  "supported");
+              return absl::UnknownError("");
+            }
+            auto rotate_packing = [&](Value v) -> Value {
+              auto i16_vreg =
+                  getNativeVregType(builder.getI16Type(), ctx.target_shape);
+              auto i32_vreg =
+                  getNativeVregType(builder.getI32Type(), ctx.target_shape);
+              Value v_int =
+                  builder.create<tpu::BitcastVregOp>(loc, i16_vreg, v);
+              Value low = builder.create<tpu::UnpackSubelementsOp>(
+                  loc, i32_vreg, v_int, 0, tpu::PackFormat::kInterleaved);
+              Value high = builder.create<tpu::UnpackSubelementsOp>(
+                  loc, i32_vreg, v_int, 1, tpu::PackFormat::kInterleaved);
+              Value flipped = builder.create<tpu::PackSubelementsOp>(
+                  loc, i16_vreg, ValueRange{high, low},
+                  tpu::PackFormat::kInterleaved);
+              return builder.create<tpu::BitcastVregOp>(loc, v.getType(),
+                                                        flipped);
+            };
+            Value acc_rot = rotate_packing(*acc_vreg);
+            switch (tpu_kind) {
+              case tpu::ReductionKind::SUM:
+                acc_vreg =
+                    builder.create<arith::AddFOp>(loc, *acc_vreg, acc_rot);
+                break;
+              case tpu::ReductionKind::MAX:
+                acc_vreg =
+                    builder.create<arith::MaximumFOp>(loc, *acc_vreg, acc_rot);
+                break;
+              case tpu::ReductionKind::MIN:
+                acc_vreg =
+                    builder.create<arith::MinimumFOp>(loc, *acc_vreg, acc_rot);
+                break;
+            }
+          }
           acc_vreg = builder.create<tpu::AllReduceOp>(
               multi_reduction_op->getLoc(), *acc_vreg, 0, tpu_kind);
         }
@@ -6230,7 +6275,8 @@ FailureOr<std::pair<VectorLayout, xla::Array<Value>>> changeTiling(
         src_idx[src_idx.size() - 1] /= vty_packing;
         for (int i = 0; i < vty_packing; ++i) {
           parts.push_back(builder.create<tpu::UnpackSubelementsOp>(
-              loc, vreg_x32, vregs(src_idx), vreg_part));
+              loc, vreg_x32, vregs(src_idx), vreg_part,
+              tpu::PackFormat::kCompressed));
           if (src_idx[src_idx.size() - 2] <
               vregs.dim(vregs.num_dimensions() - 2) - 1) {
             ++src_idx[src_idx.size() - 2];
@@ -6310,7 +6356,8 @@ FailureOr<std::pair<VectorLayout, xla::Array<Value>>> changeTiling(
       *(src_idx.end() - 1) /= packing;
       for (int i = 0; i < packing; ++i) {
         parts.push_back(builder.create<tpu::UnpackSubelementsOp>(
-            loc, vreg_x32, vregs(src_idx), vreg_part));
+            loc, vreg_x32, vregs(src_idx), vreg_part,
+            tpu::PackFormat::kCompressed));
         if (*(src_idx.end() - 2) < *(vregs.dimensions().end() - 2) - 1) {
           ++*(src_idx.end() - 2);
         }  // The rest is padding, so just pick any of the input parts (but not
